@@ -1,0 +1,184 @@
+---
+title: "Insightful Health Explorer"
+format: html
+server: shiny
+---
+```{r}
+# Load necessary libraries
+library(shiny)
+library(shinydashboard)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(DT)
+library(synthpop)      # For generating synthetic data
+library(truncnorm)     # For truncated normal distribution
+
+# Function to generate synthetic patient data
+generate_synthetic_data <- function(n_patients, custom_columns = list()) {
+  # Define a sample dataset structure for synthesis
+  sample_data <- data.frame(
+    Age = round(rtruncnorm(n_patients, a = 0, b = 100, mean = 50, sd = 15)),  # realistic age range
+    BMI = round(rtruncnorm(n_patients, a = 15, b = 40, mean = 25, sd = 5), 1), # realistic BMI range
+    BloodPressure = round(rtruncnorm(n_patients, a = 80, b = 180, mean = 120, sd = 15)), # realistic BP range
+    A1C = round(rtruncnorm(n_patients, a = 4, b = 14, mean = 6, sd = 1), 1),  # realistic A1C range
+    Cholesterol = round(rtruncnorm(n_patients, a = 100, b = 300, mean = 200, sd = 40)), # realistic cholesterol range
+    SmokingStatus = sample(c("Non-smoker", "Former smoker", "Current smoker"), n_patients, replace = TRUE),
+    DiabetesRisk = sample(0:1, n_patients, replace = TRUE)
+  )
+
+  # Use synthpop to create a synthetic version of the base sample data
+  synthetic_data <- syn(sample_data)$syn
+  
+  # Add custom columns if specified by user
+  for (col in names(custom_columns)) {
+    if (custom_columns[[col]]$type == "numeric") {
+      synthetic_data[[col]] <- runif(n_patients, custom_columns[[col]]$min, custom_columns[[col]]$max)
+    } else if (custom_columns[[col]]$type == "categorical") {
+      synthetic_data[[col]] <- sample(custom_columns[[col]]$categories, n_patients, replace = TRUE)
+    }
+  }
+  
+  return(synthetic_data)
+}
+
+# UI
+ui <- dashboardPage(
+  dashboardHeader(title = "Insightful Health Explorer"),
+  dashboardSidebar(
+    sliderInput("n_patients", "Number of Patients:", min = 100, max = 10000, value = 1000),
+    actionButton("add_column", "Add Custom Column"),
+    uiOutput("custom_column_inputs"),
+    selectInput("plot_type", "Plot Type:", 
+                choices = c("Scatter", "Histogram", "Density", "Box Plot", "Bar Chart")),
+    uiOutput("variable_selectors")
+  ),
+  dashboardBody(
+    fluidRow(
+      box(plotlyOutput("main_plot"), width = 12)
+    ),
+    fluidRow(
+      box(DT::dataTableOutput("patient_table"), width = 12)
+    )
+  )
+)
+
+# Server
+server <- function(input, output, session) {
+  custom_columns <- reactiveVal(list())
+  
+  observeEvent(input$add_column, {
+    showModal(modalDialog(
+      title = "Add Custom Column",
+      textInput("new_col_name", "Column Name:"),
+      selectInput("new_col_type", "Data Type:", choices = c("numeric", "categorical")),
+      uiOutput("new_col_params"),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("save_column", "Add Column")
+      )
+    ))
+  })
+  
+  output$new_col_params <- renderUI({
+    if (input$new_col_type == "numeric") {
+      tagList(
+        numericInput("new_col_min", "Minimum Value:", 0),
+        numericInput("new_col_max", "Maximum Value:", 100)
+      )
+    } else if (input$new_col_type == "categorical") {
+      textInput("new_col_categories", "Categories (comma-separated):")
+    }
+  })
+  
+  observeEvent(input$save_column, {
+    new_col <- list()
+    new_col[[input$new_col_name]] <- list(
+      type = input$new_col_type,
+      min = if(input$new_col_type == "numeric") input$new_col_min else NULL,
+      max = if(input$new_col_type == "numeric") input$new_col_max else NULL,
+      categories = if(input$new_col_type == "categorical") strsplit(input$new_col_categories, ",")[[1]] else NULL
+    )
+    custom_columns(c(custom_columns(), new_col))
+    removeModal()
+  })
+  
+  output$custom_column_inputs <- renderUI({
+    lapply(names(custom_columns()), function(col) {
+      column(4, 
+             h4(col),
+             if(custom_columns()[[col]]$type == "numeric") {
+               sliderInput(paste0("filter_", col), "Filter:", 
+                           min = custom_columns()[[col]]$min, 
+                           max = custom_columns()[[col]]$max, 
+                           value = c(custom_columns()[[col]]$min, custom_columns()[[col]]$max))
+             } else {
+               checkboxGroupInput(paste0("filter_", col), "Filter:", 
+                                  choices = custom_columns()[[col]]$categories,
+                                  selected = custom_columns()[[col]]$categories)
+             }
+      )
+    })
+  })
+  
+  output$variable_selectors <- renderUI({
+    all_vars <- c("Age", "BMI", "BloodPressure", "A1C", "Cholesterol", names(custom_columns()))
+    tagList(
+      selectInput("x_var", "X-axis Variable:", choices = all_vars),
+      if(input$plot_type == "Scatter") selectInput("y_var", "Y-axis Variable:", choices = all_vars),
+      if(input$plot_type %in% c("Scatter", "Bar Chart")) selectInput("color_var", "Color Variable:", choices = c("None", all_vars))
+    )
+  })
+  
+  synthetic_data <- reactive({
+    data <- generate_synthetic_data(input$n_patients, custom_columns())
+    
+    # Apply filters
+    for (col in names(custom_columns())) {
+      if (custom_columns()[[col]]$type == "numeric") {
+        range <- input[[paste0("filter_", col)]]
+        data <- data[data[[col]] >= range[1] & data[[col]] <= range[2], ]
+      } else {
+        selected <- input[[paste0("filter_", col)]]
+        if (!is.null(selected)) {
+          data <- data[data[[col]] %in% selected, ]
+        }
+      }
+    }
+    
+    data
+  })
+  
+  output$main_plot <- renderPlotly({
+    req(input$x_var)
+    data <- synthetic_data()
+    
+    p <- ggplot(data, aes_string(x = input$x_var))
+    
+    if (input$plot_type == "Scatter") {
+      req(input$y_var)
+      p <- p + geom_point(aes_string(y = input$y_var, color = if(input$color_var != "None") input$color_var else NULL))
+    } else if (input$plot_type == "Histogram") {
+      p <- p + geom_histogram(bins = 30, fill = "skyblue", color = "black")
+    } else if (input$plot_type == "Density") {
+      p <- p + geom_density(fill = "skyblue", alpha = 0.7)
+    } else if (input$plot_type == "Box Plot") {
+      p <- p + geom_boxplot(fill = "skyblue")
+    } else if (input$plot_type == "Bar Chart") {
+      p <- p + geom_bar(aes_string(fill = if(input$color_var != "None") input$color_var else NULL))
+    }
+    
+    p <- p + theme_minimal() + labs(title = paste("Plot of", input$x_var))
+    
+    ggplotly(p)
+  })
+  
+  output$patient_table <- DT::renderDataTable({
+    DT::datatable(synthetic_data(), options = list(pageLength = 10))
+  })
+}
+
+# Run the app
+shinyApp(ui, server)
+```
+
